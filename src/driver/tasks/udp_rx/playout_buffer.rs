@@ -8,6 +8,15 @@ pub struct StoredPacket {
     pub packet: Bytes,
     // We need to store this as it's possible that a user can change config modes.
     pub decrypted: bool,
+    /// Byte index into the RTP payload where the Opus frame begins.
+    pub payload_offset: usize,
+    /// Number of bytes at the end of the RTP payload which are not Opus frame:
+    /// the transport tag and nonce, RTP padding, and the leftover of a DAVE
+    /// frame's trailer once its plaintext has been written over the frame.
+    ///
+    /// Only the receive path knows these (it alone sees the DAVE layer), so they
+    /// travel with the packet rather than being recomputed at playout.
+    pub payload_end_pad: usize,
 }
 
 /// Determines whether an SSRC's packets should be decoded.

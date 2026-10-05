@@ -1,6 +1,8 @@
 mod decode_sizes;
 mod playout_buffer;
 mod ssrc_state;
+#[cfg(test)]
+mod tests;
 
 use self::{decode_sizes::*, playout_buffer::*, ssrc_state::*};
 
@@ -8,7 +10,7 @@ use super::message::*;
 use crate::driver::{CryptoMode, DecodeMode};
 use crate::{
     constants::*,
-    driver::crypto::Cipher,
+    driver::{crypto::Cipher, tasks::error::Error},
     events::{context_data::VoiceTick, internal_data::*, CoreContext},
     Config,
 };
@@ -168,17 +170,15 @@ impl UdpRx {
                 }
 
                 let mut packet_data = if self.config.decode_mode.should_decrypt() {
-                    let out = self.cipher.decrypt_rtp_in_place(&mut rtp).map(|(s, t)| {
-                        if rtp.get_padding() != 0 {
-                            let payload = rtp.payload();
-                            let payload_length = payload.len();
-                            let padding_count = payload[payload_length - t - 1] as usize;
-
-                            (s, t + padding_count, true)
-                        } else {
-                            (s, t, true)
-                        }
-                    });
+                    let out = self
+                        .cipher
+                        .decrypt_rtp_in_place(&mut rtp)
+                        .and_then(|(s, t)| {
+                            let has_padding = rtp.get_padding() != 0;
+                            opus_frame_bounds(rtp.payload(), s, t, has_padding)
+                                .map(|(s, t)| (s, t, true))
+                                .ok_or(Error::IllegalVoicePacket)
+                        });
 
                     if let Err(ref e) = out {
                         warn!("RTP decryption failed: {:?}", e);
@@ -226,11 +226,15 @@ impl UdpRx {
 
                         match result {
                             Ok(decrypted_body) => {
-                                packet_data = Some((
-                                    rtp_body_start,
-                                    rtp_body_tail + (body.len() - decrypted_body.len()),
-                                    decrypted,
-                                ));
+                                // The plaintext frame is shorter than the DAVE frame: whatever
+                                // of the trailer it does not overwrite belongs to the tail.
+                                let Some(freed) = body.len().checked_sub(decrypted_body.len())
+                                else {
+                                    error!("DAVE plaintext longer than its frame");
+                                    return;
+                                };
+                                packet_data =
+                                    Some((rtp_body_start, rtp_body_tail + freed, decrypted));
                                 body[..decrypted_body.len()].copy_from_slice(&decrypted_body);
                             },
                             Err(davey::errors::DecryptError::NoDecryptorForUser)
@@ -262,7 +266,7 @@ impl UdpRx {
                 let entry = self
                     .decoder_map
                     .entry(rtp.get_ssrc())
-                    .or_insert_with(|| SsrcState::new(&rtp, crypto_mode, &self.config));
+                    .or_insert_with(|| SsrcState::new(&rtp, &self.config));
 
                 // Only do this on RTP, rather than RTCP -- this pins decoder state liveness
                 // to *speech* rather than just presence.
@@ -271,6 +275,8 @@ impl UdpRx {
                 let store_pkt = StoredPacket {
                     packet: packet.freeze(),
                     decrypted,
+                    payload_offset: rtp_body_start,
+                    payload_end_pad: rtp_body_tail,
                 };
                 let packet = store_pkt.packet.clone();
                 entry.store_packet(store_pkt, &self.config);
@@ -355,4 +361,32 @@ pub(crate) async fn runner(
 #[inline]
 fn rtp_valid(packet: &RtpPacket<'_>) -> bool {
     packet.get_version() == RTP_VERSION && packet.get_payload_type() == RTP_PROFILE_TYPE
+}
+
+/// Locates the Opus frame in a transport-decrypted RTP payload.
+///
+/// `start` is the first byte after any header extension, and `tail` the number of
+/// bytes the transport cipher occupies at the end (tag and nonce). With the RTP
+/// padding bit set, the last byte before that suffix counts the padding octets,
+/// itself included (RFC 3550, section 5.1), and those are added to the tail.
+///
+/// Returns `(start, tail)` bounding the frame, or `None` when the bounds do not fit
+/// in the payload. The padding count is sender-controlled, so it is checked rather
+/// than trusted.
+fn opus_frame_bounds(
+    payload: &[u8],
+    start: usize,
+    tail: usize,
+    has_padding: bool,
+) -> Option<(usize, usize)> {
+    let end = payload.len().checked_sub(tail)?;
+    if start > end {
+        return None;
+    }
+    if !has_padding {
+        return Some((start, tail));
+    }
+
+    let count = usize::from(payload[end.checked_sub(1)?]);
+    (count >= 1 && start + count <= end).then_some((start, tail + count))
 }
