@@ -157,7 +157,7 @@ twilight = ["dep:twilight-gateway", "dep:twilight-model"]
 
 # Behaviour altering features.
 builtin-queue = []
-receive = ["dep:bytes", "discortp?/demux", "discortp?/rtcp"]
+receive = ["dep:bytes", "dep:dashmap", "discortp?/demux", "discortp?/rtcp"]
 
 # Used for docgen/testing/benchmarking.
 full-doc = ["default", "tungstenite", "twilight", "builtin-queue", "receive"]
