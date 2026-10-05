@@ -193,6 +193,52 @@ async fn rtp_padding_never_reaches_decoder() {
 }
 
 #[test]
+fn loss_concealment_lasts_one_tick() {
+    let frame = opus_frame();
+    let cases = [
+        (Channels::Mono, SampleRate::Hz16000, 320),
+        (Channels::Mono, SampleRate::Hz48000, 960),
+        (Channels::Stereo, SampleRate::Hz16000, 640),
+        (Channels::Stereo, SampleRate::Hz48000, 1920),
+    ];
+
+    for (channels, sample_rate, tick_len) in cases {
+        let decode = DecodeConfig::new(channels, sample_rate);
+        let config = rx_config(decode);
+        let first = rtp_packet(1, 0, false, &frame);
+        let mut state = SsrcState::new(&RtpPacket::new(&first).unwrap(), &config);
+
+        // Sequence 2 never arrives.
+        for (seq, timestamp) in [(1, 0), (3, 2 * MONO_FRAME_SIZE as u32)] {
+            let packet = rtp_packet(seq, timestamp, false, &frame);
+            let stored = StoredPacket {
+                packet: Bytes::from(packet),
+                decrypted: true,
+                payload_offset: 0,
+                payload_end_pad: 0,
+            };
+            state.store_packet(stored, &config);
+        }
+
+        let heard = state.get_voice_tick(&config).unwrap().expect("packet 1");
+        assert!(heard.packet.is_some());
+        assert_eq!(
+            heard.decoded_voice.map(|audio| audio.len()),
+            Some(tick_len),
+            "{channels:?} {sample_rate:?}: a received frame"
+        );
+
+        let lost = state.get_voice_tick(&config).unwrap().expect("packet 2");
+        assert!(lost.packet.is_none());
+        assert_eq!(
+            lost.decoded_voice.map(|audio| audio.len()),
+            Some(tick_len),
+            "{channels:?} {sample_rate:?}: a concealed frame"
+        );
+    }
+}
+
+#[test]
 fn padding_count_is_checked() {
     let tag = CryptoMode::Aes256Gcm.payload_suffix_len();
     let payload = |body: &[u8]| {

@@ -5,6 +5,7 @@ use crate::{
         Channels,
         DecodeConfig,
         DecodeMode,
+        SampleRate,
     },
     events::context_data::{RtpData, VoiceData},
 };
@@ -20,6 +21,7 @@ pub struct SsrcState {
     pub(crate) prune_time: Instant,
     pub(crate) disconnected: bool,
     channels: Channels,
+    sample_rate: SampleRate,
 }
 
 impl SsrcState {
@@ -38,6 +40,7 @@ impl SsrcState {
             prune_time: Instant::now() + config.decode_state_timeout.into(),
             disconnected: false,
             channels,
+            sample_rate,
         }
     }
 
@@ -46,6 +49,17 @@ impl SsrcState {
             .expect("Failed to create new Opus decoder for source.");
 
         self.channels = config.channels;
+        self.sample_rate = config.sample_rate;
+    }
+
+    /// Number of samples (all channels) in one tick's worth of output audio.
+    ///
+    /// Loss concealment produces exactly as many samples as it is asked for, so
+    /// the request must be sized from the output format rather than from the
+    /// 48kHz stereo frame size.
+    fn tick_len(&self) -> usize {
+        let per_channel = u32::from(self.sample_rate) as usize / AUDIO_FRAME_RATE;
+        per_channel * self.channels.channels()
     }
 
     pub fn store_packet(&mut self, packet: StoredPacket, config: &Config) {
@@ -111,12 +125,12 @@ impl SsrcState {
             out.packet = Some(rtp_data);
             out.decoded_voice = audio;
         } else if should_decode {
-            let mut audio = vec![0; self.decode_size.len()];
+            let mut audio = vec![0; self.tick_len()];
             let dest_samples = (&mut audio[..])
                 .try_into()
                 .expect("Decode logic will cap decode buffer size at i32::MAX.");
             let len = self.decoder.decode(&[], dest_samples, false)?;
-            audio.truncate(2 * len);
+            audio.truncate(self.channels.channels() * len);
 
             out.decoded_voice = Some(audio);
         }
@@ -132,7 +146,7 @@ impl SsrcState {
         decode: bool,
     ) -> Result<Option<Vec<i16>>> {
         let pkt = if decode {
-            let mut concealed = vec![0; self.decode_size.len()];
+            let mut concealed = vec![0; self.tick_len()];
             for _ in 0..missed_packets {
                 if let Err(e) = self.decoder.decode(&[], &mut concealed, false) {
                     warn!("Issue while decoding for missed packet: {:?}.", e);
